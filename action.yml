@@ -1,0 +1,112 @@
+name: Midwrite
+description: Find partial-failure windows in TypeScript backends (Drizzle on PostgreSQL) and comment only on new findings in pull requests.
+author: astra-void
+branding:
+  icon: git-pull-request
+  color: orange
+
+inputs:
+  version:
+    description: Version of the midwrite npm package to run.
+    default: "0.1.0"
+  paths:
+    description: Files or directories to analyze, separated by spaces, relative to working-directory.
+    default: "."
+  working-directory:
+    description: Directory to run in (for monorepos). Fingerprints are relative to it.
+    default: "."
+  config:
+    description: Path to midwrite.json, relative to working-directory. Defaults to midwrite.json when it exists. The pull request's configuration is also used for the base commit, so a config change alone never creates "new" findings.
+    default: ""
+  policy:
+    description: Severity policy (recommended, strict or audit).
+    default: recommended
+  fail-on:
+    description: Fail the step when a NEW finding reaches this severity (error, warning, info or never). Findings that already exist on the base branch never fail the step.
+    default: warning
+  comment:
+    description: Post or update one pull request comment listing new findings (true or false).
+    default: "true"
+  comment-severity:
+    description: Lowest severity listed in the comment (error, warning or info). Lower-severity new findings are only counted.
+    default: warning
+  upload-sarif:
+    description: Upload SARIF to GitHub code scanning (true or false). Needs security-events write permission.
+    default: "true"
+  github-token:
+    description: Token used to comment on the pull request.
+    default: ${{ github.token }}
+
+outputs:
+  new-findings:
+    description: Number of findings in this pull request that are not on the base commit (all severities).
+    value: ${{ steps.scan.outputs.new }}
+  exit-code:
+    description: Exit status of midwrite check (0 clean, 1 new findings at or above fail-on, 2 usage or configuration error, 3 files could not be parsed).
+    value: ${{ steps.scan.outputs.code }}
+  sarif-file:
+    description: Path of the SARIF file.
+    value: ${{ steps.scan.outputs.sarif }}
+  json-file:
+    description: Path of the JSON report.
+    value: ${{ steps.scan.outputs.json }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install midwrite
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        prefix="$RUNNER_TEMP/midwrite-cli"
+        npm install --prefix "$prefix" --no-audit --no-fund --loglevel=error "midwrite@$VERSION"
+        bin="$prefix/node_modules/.bin/midwrite"
+        "$bin" --version
+        echo "MIDWRITE_BIN=$bin" >> "$GITHUB_ENV"
+
+    - name: Analyze
+      id: scan
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        PATHS: ${{ inputs.paths }}
+        CONFIG: ${{ inputs.config }}
+        POLICY: ${{ inputs.policy }}
+        FAIL_ON: ${{ inputs.fail-on }}
+        WORKDIR: ${{ inputs.working-directory }}
+        BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      run: bash "$GITHUB_ACTION_PATH/scan.sh"
+
+    - name: Upload SARIF to code scanning
+      if: ${{ !cancelled() && inputs.upload-sarif == 'true' && steps.scan.outputs.sarif != '' }}
+      uses: github/codeql-action/upload-sarif@v4
+      with:
+        sarif_file: ${{ steps.scan.outputs.sarif }}
+        category: midwrite
+
+    - name: Comment on the pull request
+      if: ${{ !cancelled() && inputs.comment == 'true' && github.event.pull_request.number && steps.scan.outputs.json != '' }}
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        REPORT: ${{ steps.scan.outputs.json }}
+        BASE_STATUS: ${{ steps.scan.outputs.base }}
+        WORKDIR: ${{ inputs.working-directory }}
+        COMMENT_SEVERITY: ${{ inputs.comment-severity }}
+      run: node "$GITHUB_ACTION_PATH/comment.mjs"
+
+    - name: Apply fail-on
+      if: ${{ !cancelled() }}
+      shell: bash
+      env:
+        CODE: ${{ steps.scan.outputs.code }}
+      run: |
+        case "$CODE" in
+          0) exit 0 ;;
+          1) echo "::error::midwrite found new findings at or above the fail-on threshold"; exit 1 ;;
+          *) echo "::error::midwrite check exited with status ${CODE:-unknown}"; exit "${CODE:-2}" ;;
+        esac
